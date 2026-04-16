@@ -1,13 +1,14 @@
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
-from difflib import SequenceMatcher
 from patiencediff import PatienceSequenceMatcher
 import json
 
-def row_similarity(row_a, row_b):
-    """行同士の類似度"""
-    return SequenceMatcher(None, row_a, row_b).ratio()
-
+def row_similarity(a, b):
+    cnt = 0
+    for x, y in zip(a, b):
+        if x == y:
+            cnt += 1
+    return cnt / len(a)
 
 def match_rows(sub_a, sub_b, threshold=0.5):
     """
@@ -69,9 +70,7 @@ def get_header_map(ws, headrow=1):
 
     return header_map
 
-def compare_columns(wb1, wb2, sheet_name, headrow=1):
-    ws1 = wb1[sheet_name]
-    ws2 = wb2[sheet_name]
+def compare_columns(ws1, ws2, sheet_name, headrow=1):
 
     header1 = get_header_map(ws1, headrow)  # {name: col_index}
     header2 = get_header_map(ws2, headrow)
@@ -94,13 +93,23 @@ def compare_columns(wb1, wb2, sheet_name, headrow=1):
     }
 
 def normalize_row(row, common_cols):
-    return tuple(
-        "" if row[col-1].value is None else str(row[col-1].value)
-        for col in common_cols
-    )
+    result = []
+    append = result.append  # ローカル化（高速化）
+
+    for col in common_cols:
+        v = row[col-1]
+
+        if v is None:
+            append("")
+        elif isinstance(v, (int, float)):
+            append(v)
+        else:
+            append(str(v))
+
+    return tuple(result)
 
 def trim_tail_empty(rows):
-    while rows and all(cell == "" or cell is None for cell in rows[-1]):
+    while rows and not any(rows[-1]):
         rows.pop()
     return rows
 
@@ -108,7 +117,14 @@ def to_excel_row(idx, base):
     return idx + base
 
 def to_excel_cell(col_idx, row_idx):
-    return f"{get_column_letter(col_idx)}{row_idx}"
+    return f"{fast_col_letter(col_idx)}{row_idx}"
+
+col_cache = {}
+
+def fast_col_letter(col):
+    if col not in col_cache:
+        col_cache[col] = get_column_letter(col)
+    return col_cache[col]
 
 def exceldiff(path1 , 
          path2 ,
@@ -117,8 +133,8 @@ def exceldiff(path1 ,
          threshold=0.5):
     
     base = headrow + 1
-    wb1 = load_workbook(path1, data_only=dataonly)
-    wb2 = load_workbook(path2, data_only=dataonly)
+    wb1 = load_workbook(path1, data_only=dataonly, read_only=True)
+    wb2 = load_workbook(path2, data_only=dataonly, read_only=True)
 
     result = compare_sheets(wb1, wb2)
 
@@ -130,7 +146,9 @@ def exceldiff(path1 ,
 
     sheet_modified= {}
     for sheet_name in result["common"]:
-        colresult = compare_columns(wb1, wb2, sheet_name, headrow)
+        ws1 = wb1[sheet_name]
+        ws2 = wb2[sheet_name]
+        colresult = compare_columns(ws1, ws2, sheet_name, headrow)
 
         if colresult["added"]:
             sheet_modified.setdefault(sheet_name, {}).setdefault("columns", {})["added"] = [
@@ -145,20 +163,22 @@ def exceldiff(path1 ,
                 ]
 
         common_pairs = sorted(colresult["common"], key=lambda x: x[1])
-        common_cols_a = [v[0] for v in common_pairs]
-        common_cols_b = [v[1] for v in common_pairs]
+        common_cols_a, common_cols_b = zip(*common_pairs) if common_pairs else ([], [])
+        
         rows_a = [
             normalize_row(r, common_cols_a)
-            for r in wb1[sheet_name].iter_rows(min_row=headrow+1)
+            for r in ws1.iter_rows(min_row=headrow+1, values_only=True)
         ]
         rows_b = [
             normalize_row(r, common_cols_b)
-            for r in wb2[sheet_name].iter_rows(min_row=headrow+1)
+            for r in ws2.iter_rows(min_row=headrow+1, values_only=True)
         ]
         rows_a = trim_tail_empty(rows_a)
         rows_b = trim_tail_empty(rows_b)
+        rows_a_sha = [hash(r) for r in rows_a]
+        rows_b_sha = [hash(r) for r in rows_b]
 
-        sm = PatienceSequenceMatcher(None, rows_a, rows_b)
+        sm = PatienceSequenceMatcher(None, rows_a_sha, rows_b_sha)
         added_rows = []
         removed_rows = []
         cellsdiff = []
@@ -191,10 +211,10 @@ def exceldiff(path1 ,
 
                         for col_idx, (a, b) in enumerate(zip(row_a, row_b)):
                             if a != b:
-                                cell_changes.append({
-                                    "from": to_excel_cell(common_pairs[col_idx][0], excel_i),
-                                    "to": to_excel_cell(common_pairs[col_idx][1], excel_j)
-                                })
+                                cell_changes.append((
+                                    to_excel_cell(common_pairs[col_idx][0], excel_i),
+                                    to_excel_cell(common_pairs[col_idx][1], excel_j)
+                                ))
 
                 # 行追加
                 for j in unmatched_b:
@@ -217,9 +237,8 @@ def exceldiff(path1 ,
             sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {})["deleted"] = sorted(removed_rows)
             
         if cellsdiff:
-            sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {}).update({
-                "modified": cellsdiff
-            })
+            sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {}).update({"modified": cellsdiff})
+            
     if sheet_modified:
         diff_result.setdefault("sheet_modified", {}).update(sheet_modified)
     return diff_result
