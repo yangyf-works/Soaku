@@ -65,6 +65,7 @@ def validate_args(args):
         sys.exit(1)
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")
     args = parse_args()
     validate_args(args)
 

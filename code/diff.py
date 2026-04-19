@@ -1,7 +1,10 @@
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from patiencediff import PatienceSequenceMatcher
-import json
+import hashlib
+
+def stable_hash(row):
+    return hashlib.md5(repr(row).encode()).hexdigest()
 
 def row_similarity(a, b):
     cnt = 0
@@ -64,54 +67,64 @@ def get_header_map(ws, headrow=1):
     """
     header_map = {}
 
-    for col_idx, cell in enumerate(ws[headrow], start=1):
-        if cell.value is not None:
-            header_map[str(cell.value)] = col_idx
+    row = next(ws.iter_rows(min_row=headrow, max_row=headrow, values_only=True))
+
+    for col_idx, v in enumerate(row, start=1):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+
+        header_map[str(v)] = col_idx
 
     return header_map
 
-def compare_columns(ws1, ws2, sheet_name, headrow=1):
+def compare_columns(ws1, ws2, headrow=1):
 
-    header1 = get_header_map(ws1, headrow)  # {name: col_index}
+    header1 = get_header_map(ws1, headrow)
     header2 = get_header_map(ws2, headrow)
 
     set1 = set(header1.keys())
     set2 = set(header2.keys())
 
-    # ★ ここを変更
     added = [header2[col] for col in (set2 - set1)]
     deleted = [header1[col] for col in (set1 - set2)]
-    common = [
-        (header1[col], header2[col])
-        for col in (set1 & set2)
-    ]
+    common_keys = set1 & set2
+
+    common_cols_a = [header1[col] for col in common_keys]
+    common_cols_b = [header2[col] for col in common_keys]
+    pairs = list(zip(common_cols_a, common_cols_b))
+
+    pairs.sort(key=lambda x: x[1])  # common_cols_bでソート
+    if pairs:
+        common_cols_a, common_cols_b = zip(*pairs)
+    else:
+        common_cols_a, common_cols_b = [], []
 
     return {
-        "added": added,       # [col_index_in_file2]
-        "deleted": deleted,   # [col_index_in_file1]
-        "common": common,     # [(idx1, idx2)]
+        "added": added,   
+        "deleted": deleted,
+        "common": [common_cols_a, common_cols_b]
     }
 
 def normalize_row(row, common_cols):
     result = []
-    append = result.append  # ローカル化（高速化）
+    append = result.append
 
     for col in common_cols:
         v = row[col-1]
 
         if v is None:
             append("")
-        elif isinstance(v, (int, float)):
-            append(v)
         else:
             append(str(v))
 
     return tuple(result)
 
-def trim_tail_empty(rows):
-    while rows and not any(rows[-1]):
-        rows.pop()
-    return rows
+def find_last_row(ws, start_row, cols):
+    for row_idx in range(ws.max_row, start_row - 1, -1):
+        row = ws[row_idx]
+        if any(row[col-1].value not in (None, "") for col in cols):
+            return row_idx
+    return start_row
 
 def to_excel_row(idx, base):
     return idx + base
@@ -126,7 +139,8 @@ def fast_col_letter(col):
         col_cache[col] = get_column_letter(col)
     return col_cache[col]
 
-def exceldiff(path1 , 
+def exceldiff(
+         path1 , 
          path2 ,
          dataonly=False,
          headrow=1,
@@ -148,7 +162,7 @@ def exceldiff(path1 ,
     for sheet_name in result["common"]:
         ws1 = wb1[sheet_name]
         ws2 = wb2[sheet_name]
-        colresult = compare_columns(ws1, ws2, sheet_name, headrow)
+        colresult = compare_columns(ws1, ws2, headrow)
 
         if colresult["added"]:
             sheet_modified.setdefault(sheet_name, {}).setdefault("columns", {})["added"] = [
@@ -161,83 +175,82 @@ def exceldiff(path1 ,
                     get_column_letter(col)
                     for col in sorted(colresult["deleted"])
                 ]
+            
+        common_cols_a=[]
+        common_cols_b=[]
+        if colresult["common"][0]:
+            common_cols_a, common_cols_b = colresult["common"]
+            last_a = find_last_row(ws1, headrow+1, common_cols_a)
+            last_b = find_last_row(ws2, headrow+1, common_cols_b)
+            rows_a = [
+                normalize_row(r, common_cols_a)
+                for r in ws1.iter_rows(min_row=headrow+1, max_row=last_a, values_only=True)
+            ]
+            rows_b = [
+                normalize_row(r, common_cols_b)
+                for r in ws2.iter_rows(min_row=headrow+1, max_row=last_b, values_only=True)
+            ]
+            rows_a_sha = [stable_hash(r) for r in rows_a]
+            rows_b_sha = [stable_hash(r) for r in rows_b]
 
-        common_pairs = sorted(colresult["common"], key=lambda x: x[1])
-        common_cols_a, common_cols_b = zip(*common_pairs) if common_pairs else ([], [])
-        
-        rows_a = [
-            normalize_row(r, common_cols_a)
-            for r in ws1.iter_rows(min_row=headrow+1, values_only=True)
-        ]
-        rows_b = [
-            normalize_row(r, common_cols_b)
-            for r in ws2.iter_rows(min_row=headrow+1, values_only=True)
-        ]
-        rows_a = trim_tail_empty(rows_a)
-        rows_b = trim_tail_empty(rows_b)
-        rows_a_sha = [hash(r) for r in rows_a]
-        rows_b_sha = [hash(r) for r in rows_b]
+            sm = PatienceSequenceMatcher(None, rows_a_sha, rows_b_sha)
+            added_rows = []
+            removed_rows = []
+            cellsdiff = []
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag == "replace":
+                    sub_a = rows_a[i1:i2]
+                    sub_b = rows_b[j1:j2]
 
-        sm = PatienceSequenceMatcher(None, rows_a_sha, rows_b_sha)
-        added_rows = []
-        removed_rows = []
-        cellsdiff = []
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag == "replace":
-                sub_a = rows_a[i1:i2]
-                sub_b = rows_b[j1:j2]
+                    """
+                    replaceブロックを解析して
+                    行変更・行追加・行削除・セル変更を再構築する
+                    """
+                    matched, unmatched_b = match_rows(sub_a, sub_b, threshold)
+                    
+                    # 行削除・行変更
+                    for i, j in matched:
+                        abs_i = i1 + i
+                        excel_i = to_excel_row(abs_i, base)
+                        if j is None:
+                            removed_rows.append(excel_i)
+                        else:
+                            abs_j = j1 + j
+                            excel_j = to_excel_row(abs_j, base)
 
-                """
-                replaceブロックを解析して
-                行変更・行追加・行削除・セル変更を再構築する
-                """
-                matched, unmatched_b = match_rows(sub_a, sub_b, threshold)
-                cell_changes = []
-                # 行削除・行変更
-                for i, j in matched:
-                    abs_i = i1 + i
-                    excel_i = to_excel_row(abs_i, base)
-                    if j is None:
-                        removed_rows.append(excel_i)
-                    else:
+                            row_a = sub_a[i]
+                            row_b = sub_b[j]
+
+                            if row_a == row_b:
+                                continue
+
+                            for col_idx, (a, b) in enumerate(zip(row_a, row_b)):
+                                if a != b:
+                                    cellsdiff.append((
+                                        to_excel_cell(common_cols_a[col_idx], excel_i),
+                                        to_excel_cell(common_cols_b[col_idx], excel_j)
+                                    ))
+
+                    # 行追加
+                    for j in unmatched_b:
                         abs_j = j1 + j
                         excel_j = to_excel_row(abs_j, base)
+                        added_rows.append(excel_j)
 
-                        row_a = sub_a[i]
-                        row_b = sub_b[j]
+                elif tag == "delete":
+                    removed_rows.extend(to_excel_row(i, base) for i in range(i1, i2))
 
-                        if row_a == row_b:
-                            continue
+                elif tag == "insert":
+                    added_rows.extend(to_excel_row(j, base) for j in range(j1, j2))
 
-                        for col_idx, (a, b) in enumerate(zip(row_a, row_b)):
-                            if a != b:
-                                cell_changes.append((
-                                    to_excel_cell(common_pairs[col_idx][0], excel_i),
-                                    to_excel_cell(common_pairs[col_idx][1], excel_j)
-                                ))
+            if added_rows:
+                sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {})["added"] = sorted(added_rows)
 
-                # 行追加
-                for j in unmatched_b:
-                    abs_j = j1 + j
-                    excel_j = to_excel_row(abs_j, base)
-                    added_rows.append(excel_j)
-
-                cellsdiff.extend(cell_changes)
-
-            elif tag == "delete":
-                removed_rows.extend(to_excel_row(i, base) for i in range(i1, i2))
-
-            elif tag == "insert":
-                added_rows.extend(to_excel_row(j, base) for j in range(j1, j2))
-
-        if added_rows:
-            sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {})["added"] = sorted(added_rows)
-
-        if removed_rows:
-            sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {})["deleted"] = sorted(removed_rows)
-            
-        if cellsdiff:
-            sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {}).update({"modified": cellsdiff})
+            if removed_rows:
+                sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {})["deleted"] = sorted(removed_rows)
+                
+            if cellsdiff:
+                sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {}).update({"modified": cellsdiff})
             
     if sheet_modified:
         diff_result.setdefault("sheet_modified", {}).update(sheet_modified)
