@@ -1,17 +1,19 @@
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from patiencediff import PatienceSequenceMatcher
+from difflib import SequenceMatcher
 import hashlib
 
 def stable_hash(row):
     return hashlib.md5(repr(row).encode()).hexdigest()
 
-def row_similarity(a, b):
+def row_similarity(a, b, threshold=0.5):
     cnt = 0
     for x, y in zip(a, b):
-        if x == y:
+        ratio = SequenceMatcher(None, str(x), str(y)).ratio()
+        if ratio >= threshold:
             cnt += 1
-    return cnt / len(a)
+    return cnt / max(len(a), 1)
 
 def match_rows(sub_a, sub_b, threshold=0.5):
     """
@@ -31,7 +33,7 @@ def match_rows(sub_a, sub_b, threshold=0.5):
             if j in used_b:
                 continue
 
-            score = row_similarity(row_a, row_b)
+            score = row_similarity(row_a, row_b, threshold)
             if score > best_score:
                 best_score = score
                 best_j = j
@@ -47,12 +49,16 @@ def match_rows(sub_a, sub_b, threshold=0.5):
     return matched, unmatched_b
 
 def compare_sheets(wb1, wb2):
-    sheets1 = set(wb1.sheetnames)
-    sheets2 = set(wb2.sheetnames)
+    sheets1 = wb1.sheetnames  # 順序あり
+    sheets2 = wb2.sheetnames  # 順序あり
 
-    added = sheets2 - sheets1      # file2 にのみ存在
-    deleted = sheets1 - sheets2    # file1 にのみ存在
-    common = sheets1 & sheets2     # 両方に存在
+    set1 = set(sheets1)
+    set2 = set(sheets2)
+
+    # 順序を保ったまま抽出
+    added = [s for s in sheets2 if s not in set1]     # wb2順
+    deleted = [s for s in sheets1 if s not in set2]   # wb1順
+    common = [s for s in sheets2 if s in set1]        # wb2順基準
 
     return {
         "added": added,
@@ -64,8 +70,10 @@ def get_header_map(ws, headrow=1):
     """
     ヘッダ行を取得して
     {ヘッダ名: 列番号} の辞書を返す
+    ※同名ヘッダは A, A_2, A_3... のようにする
     """
     header_map = {}
+    name_count = {}  # 出現回数を管理
 
     row = next(ws.iter_rows(min_row=headrow, max_row=headrow, values_only=True))
 
@@ -73,7 +81,17 @@ def get_header_map(ws, headrow=1):
         if v is None or (isinstance(v, str) and not v.strip()):
             continue
 
-        header_map[str(v)] = col_idx
+        base_name = str(v)
+
+        # 出現回数カウント
+        if base_name not in name_count:
+            name_count[base_name] = 1
+            name = base_name
+        else:
+            name_count[base_name] += 1
+            name = f"{base_name}_{name_count[base_name]}"
+
+        header_map[name] = col_idx
 
     return header_map
 
@@ -154,9 +172,9 @@ def exceldiff(
 
     diff_result = {}
     if result["added"]:
-        diff_result["sheet_added"] = sorted(result["added"])
+        diff_result["sheet_added"] = result["added"]
     if result["deleted"]:
-        diff_result["sheet_deleted"] = sorted(result["deleted"])
+        diff_result["sheet_deleted"] = result["deleted"]
 
     sheet_modified= {}
     for sheet_name in result["common"]:
