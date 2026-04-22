@@ -1,17 +1,17 @@
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from patiencediff import PatienceSequenceMatcher
-from difflib import SequenceMatcher
+from rapidfuzz import fuzz
 import hashlib
 
 def stable_hash(row):
     return hashlib.md5(repr(row).encode()).hexdigest()
 
 def row_similarity(a, b, threshold=0.5):
+    cutoff = threshold * 100
     cnt = 0
     for x, y in zip(a, b):
-        ratio = SequenceMatcher(None, str(x), str(y)).ratio()
-        if ratio >= threshold:
+        if fuzz.ratio(str(x), str(y), score_cutoff=cutoff):
             cnt += 1
     return cnt / max(len(a), 1)
 
