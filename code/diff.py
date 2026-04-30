@@ -1,3 +1,5 @@
+import sys
+
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from patiencediff import PatienceSequenceMatcher
@@ -11,8 +13,11 @@ def row_similarity(a, b, threshold=0.5):
     cutoff = threshold * 100
     cnt = 0
     for x, y in zip(a, b):
-        if fuzz.ratio(str(x), str(y), score_cutoff=cutoff):
+        if x == y:
             cnt += 1
+        else:
+            if fuzz.ratio(str(x), str(y), score_cutoff=cutoff):
+                cnt += 1
     return cnt / max(len(a), 1)
 
 def match_rows(sub_a, sub_b, threshold=0.5):
@@ -105,7 +110,7 @@ def compare_columns(ws1, ws2, headrow=1):
 
     added = [header2[col] for col in (set2 - set1)]
     deleted = [header1[col] for col in (set1 - set2)]
-    common_keys = set1 & set2
+    common_keys = [col for col in header2 if col in header1]
 
     common_cols_a = [header1[col] for col in common_keys]
     common_cols_b = [header2[col] for col in common_keys]
@@ -165,111 +170,129 @@ def exceldiff(
          threshold=0.5):
     
     base = headrow + 1
-    wb1 = load_workbook(path1, data_only=dataonly, read_only=True)
-    wb2 = load_workbook(path2, data_only=dataonly, read_only=True)
+    wb1 = None
+    wb2 = None
+    try:
+        wb1 = load_workbook(path1, data_only=dataonly, read_only=True)
+    except Exception as e:
+        print(f"{e}", file=sys.stderr)
+        
+    try:
+        wb2 = load_workbook(path2, data_only=dataonly, read_only=True)
+    except Exception as e:
+        print(f"{e}", file=sys.stderr)
+        
+    if wb1 is None or wb2 is None:
+        return {}
+    
+    try:
+        result = compare_sheets(wb1, wb2)
 
-    result = compare_sheets(wb1, wb2)
+        diff_result = {}
+        if result["added"]:
+            diff_result["sheet_added"] = result["added"]
+        if result["deleted"]:
+            diff_result["sheet_deleted"] = result["deleted"]
 
-    diff_result = {}
-    if result["added"]:
-        diff_result["sheet_added"] = result["added"]
-    if result["deleted"]:
-        diff_result["sheet_deleted"] = result["deleted"]
+        sheet_modified= {}
+        for sheet_name in result["common"]:
+            ws1 = wb1[sheet_name]
+            ws2 = wb2[sheet_name]
+            colresult = compare_columns(ws1, ws2, headrow)
 
-    sheet_modified= {}
-    for sheet_name in result["common"]:
-        ws1 = wb1[sheet_name]
-        ws2 = wb2[sheet_name]
-        colresult = compare_columns(ws1, ws2, headrow)
-
-        if colresult["added"]:
-            sheet_modified.setdefault(sheet_name, {}).setdefault("columns", {})["added"] = [
-                    get_column_letter(col)
-                    for col in sorted(colresult["added"])
+            if colresult["added"]:
+                sheet_modified.setdefault(sheet_name, {}).setdefault("columns", {})["added"] = [
+                        get_column_letter(col)
+                        for col in sorted(colresult["added"])
+                    ]
+                
+            if colresult["deleted"]:
+                sheet_modified.setdefault(sheet_name, {}).setdefault("columns", {})["deleted"] = [
+                        get_column_letter(col)
+                        for col in sorted(colresult["deleted"])
+                    ]
+                
+            common_cols_a=[]
+            common_cols_b=[]
+            if colresult["common"][0]:
+                common_cols_a, common_cols_b = colresult["common"]
+                last_a = find_last_row(ws1, headrow+1, common_cols_a)
+                last_b = find_last_row(ws2, headrow+1, common_cols_b)
+                rows_a = [
+                    normalize_row(r, common_cols_a)
+                    for r in ws1.iter_rows(min_row=headrow+1, max_row=last_a, values_only=True)
                 ]
-            
-        if colresult["deleted"]:
-            sheet_modified.setdefault(sheet_name, {}).setdefault("columns", {})["deleted"] = [
-                    get_column_letter(col)
-                    for col in sorted(colresult["deleted"])
+                rows_b = [
+                    normalize_row(r, common_cols_b)
+                    for r in ws2.iter_rows(min_row=headrow+1, max_row=last_b, values_only=True)
                 ]
-            
-        common_cols_a=[]
-        common_cols_b=[]
-        if colresult["common"][0]:
-            common_cols_a, common_cols_b = colresult["common"]
-            last_a = find_last_row(ws1, headrow+1, common_cols_a)
-            last_b = find_last_row(ws2, headrow+1, common_cols_b)
-            rows_a = [
-                normalize_row(r, common_cols_a)
-                for r in ws1.iter_rows(min_row=headrow+1, max_row=last_a, values_only=True)
-            ]
-            rows_b = [
-                normalize_row(r, common_cols_b)
-                for r in ws2.iter_rows(min_row=headrow+1, max_row=last_b, values_only=True)
-            ]
-            rows_a_sha = [stable_hash(r) for r in rows_a]
-            rows_b_sha = [stable_hash(r) for r in rows_b]
+                rows_a_sha = [stable_hash(r) for r in rows_a]
+                rows_b_sha = [stable_hash(r) for r in rows_b]
 
-            sm = PatienceSequenceMatcher(None, rows_a_sha, rows_b_sha)
-            added_rows = []
-            removed_rows = []
-            cellsdiff = []
-            for tag, i1, i2, j1, j2 in sm.get_opcodes():
-                if tag == "replace":
-                    sub_a = rows_a[i1:i2]
-                    sub_b = rows_b[j1:j2]
+                sm = PatienceSequenceMatcher(None, rows_a_sha, rows_b_sha)
+                added_rows = []
+                removed_rows = []
+                cellsdiff = []
+                for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                    if tag == "replace":
+                        sub_a = rows_a[i1:i2]
+                        sub_b = rows_b[j1:j2]
 
-                    """
-                    replaceブロックを解析して
-                    行変更・行追加・行削除・セル変更を再構築する
-                    """
-                    matched, unmatched_b = match_rows(sub_a, sub_b, threshold)
-                    
-                    # 行削除・行変更
-                    for i, j in matched:
-                        abs_i = i1 + i
-                        excel_i = to_excel_row(abs_i, base)
-                        if j is None:
-                            removed_rows.append(excel_i)
-                        else:
+                        """
+                        replaceブロックを解析して
+                        行変更・行追加・行削除・セル変更を再構築する
+                        """
+                        matched, unmatched_b = match_rows(sub_a, sub_b, threshold)
+                        
+                        # 行削除・行変更
+                        for i, j in matched:
+                            abs_i = i1 + i
+                            excel_i = to_excel_row(abs_i, base)
+                            if j is None:
+                                removed_rows.append(excel_i)
+                            else:
+                                abs_j = j1 + j
+                                excel_j = to_excel_row(abs_j, base)
+
+                                row_a = sub_a[i]
+                                row_b = sub_b[j]
+
+                                if row_a == row_b:
+                                    continue
+
+                                for col_idx, (a, b) in enumerate(zip(row_a, row_b)):
+                                    if a != b:
+                                        cellsdiff.append((
+                                            to_excel_cell(common_cols_a[col_idx], excel_i),
+                                            to_excel_cell(common_cols_b[col_idx], excel_j)
+                                        ))
+
+                        # 行追加
+                        for j in unmatched_b:
                             abs_j = j1 + j
                             excel_j = to_excel_row(abs_j, base)
+                            added_rows.append(excel_j)
 
-                            row_a = sub_a[i]
-                            row_b = sub_b[j]
+                    elif tag == "delete":
+                        removed_rows.extend(to_excel_row(i, base) for i in range(i1, i2))
 
-                            if row_a == row_b:
-                                continue
+                    elif tag == "insert":
+                        added_rows.extend(to_excel_row(j, base) for j in range(j1, j2))
 
-                            for col_idx, (a, b) in enumerate(zip(row_a, row_b)):
-                                if a != b:
-                                    cellsdiff.append((
-                                        to_excel_cell(common_cols_a[col_idx], excel_i),
-                                        to_excel_cell(common_cols_b[col_idx], excel_j)
-                                    ))
+                if added_rows:
+                    sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {})["added"] = sorted(added_rows)
 
-                    # 行追加
-                    for j in unmatched_b:
-                        abs_j = j1 + j
-                        excel_j = to_excel_row(abs_j, base)
-                        added_rows.append(excel_j)
-
-                elif tag == "delete":
-                    removed_rows.extend(to_excel_row(i, base) for i in range(i1, i2))
-
-                elif tag == "insert":
-                    added_rows.extend(to_excel_row(j, base) for j in range(j1, j2))
-
-            if added_rows:
-                sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {})["added"] = sorted(added_rows)
-
-            if removed_rows:
-                sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {})["deleted"] = sorted(removed_rows)
+                if removed_rows:
+                    sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {})["deleted"] = sorted(removed_rows)
+                    
+                if cellsdiff:
+                    sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {}).update({"modified": cellsdiff})
                 
-            if cellsdiff:
-                sheet_modified.setdefault(sheet_name, {}).setdefault("rows", {}).update({"modified": cellsdiff})
-            
-    if sheet_modified:
-        diff_result.setdefault("sheet_modified", {}).update(sheet_modified)
-    return diff_result
+        if sheet_modified:
+            diff_result.setdefault("sheet_modified", {}).update(sheet_modified)
+        return diff_result
+    finally:
+        if wb1:
+            wb1.close()
+        if wb2:
+            wb2.close()

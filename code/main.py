@@ -52,16 +52,16 @@ def parse_args():
 def validate_args(args):
     # ファイル存在チェック
     if not os.path.exists(args.bookPath1):
-        print(f"エラー: ファイルが存在しません: {args.bookPath1}")
+        print(f"[ERROR] ファイルが存在しません: {args.bookPath1}", file=sys.stderr)
         sys.exit(1)
 
     if not os.path.exists(args.bookPath2):
-        print(f"エラー: ファイルが存在しません: {args.bookPath2}")
+        print(f"[ERROR] ファイルが存在しません: {args.bookPath2}", file=sys.stderr)
         sys.exit(1)
 
     # thresholdチェック
     if not (0.0 <= args.threshold <= 1.0):
-        print("エラー: thresholdは0.0〜1.0で指定してください")
+        print("[ERROR] thresholdは0.0〜1.0で指定してください", file=sys.stderr)
         sys.exit(1)
 
 def main():
